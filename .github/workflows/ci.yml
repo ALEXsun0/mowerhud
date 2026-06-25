@@ -132,4 +132,5 @@ jobs:
         with:
           files: ${{ matrix.asset }}
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # 仅让一个平台生成发布说明，否则三个并发 job 各生成一次会重复
+          generate_release_notes: ${{ matrix.os == 'ubuntu-latest' }}
