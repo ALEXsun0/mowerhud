@@ -179,10 +179,10 @@ fn listening_ports() -> Vec<u16> {
                 .output()
         });
     let mut ports = Vec::new();
-    if let Ok(out) = output {
-        if let Ok(text) = String::from_utf8(out.stdout) {
-            ports.extend(parse_lsof(&text));
-        }
+    if let Ok(out) = output
+        && let Ok(text) = String::from_utf8(out.stdout)
+    {
+        ports.extend(parse_lsof(&text));
     }
     ports.retain(|&p| p >= 1024);
     ports.sort_unstable();
