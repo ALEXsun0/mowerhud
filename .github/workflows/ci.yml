@@ -35,9 +35,6 @@ jobs:
         with:
           components: clippy
 
-      # aws-lc-rs (reqwest 的 rustls 后端) 在编译汇编时需要 NASM
-      - uses: ilammy/setup-nasm@v1
-
       # Linux 下 eframe/winit/glow 需要 X11、Wayland、OpenGL 等开发库
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -66,21 +63,52 @@ jobs:
       - name: Build (debug)
         run: cargo build
 
-  # 仅在 Windows 上产出优化后的发布版 .exe 作为构建产物
-  release-windows:
-    name: release build (windows)
-    runs-on: windows-latest
+  # 三平台分别产出优化后的发布版二进制作为构建产物
+  release:
+    name: release (${{ matrix.os }})
     needs: [fmt, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: mowerhud-linux
+            bin: target/release/mowerhud
+          - os: windows-latest
+            artifact: mowerhud-windows
+            bin: target/release/mowerhud.exe
+          - os: macos-latest
+            artifact: mowerhud-macos
+            bin: target/release/mowerhud
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ilammy/setup-nasm@v1
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev
+
       - uses: Swatinem/rust-cache@v2
+
       - name: Build release
         run: cargo build --release
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mowerhud-windows
-          path: target/release/mowerhud.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bin }}
           if-no-files-found: error

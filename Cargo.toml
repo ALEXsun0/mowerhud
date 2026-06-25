@@ -20,6 +20,9 @@ notify-rust = { version = "4.18", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "windef", "utilapiset"] }
+# 启用 aws-lc-rs（reqwest 的 rustls 后端）预构建的 NASM 汇编对象，
+# 免去在 Windows 上安装 NASM 的需求，从而省掉 CI 里的 setup-nasm 步骤。
+aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
 
 # Linux 下 notify-rust 需要一个通知后端（zbus，纯 Rust）。
 # 用 target 专属依赖只在 Linux 启用，保持 Windows/macOS 构建最小化。
