@@ -3,14 +3,11 @@
 use egui::Color32;
 
 // ── 窗口尺寸 ──────────────────────────────────────────────
-/// 配置界面尺寸。
-pub const CONFIG_SIZE: [f32; 2] = [340.0, 340.0];
-/// HUD（运行界面）高度。
-pub const HUD_HEIGHT: f32 = 80.0;
-/// 只有当前任务时的 HUD 宽度。
-pub const HUD_WIDTH_SINGLE: f32 = 520.0;
-/// 同时展示下一个任务时的 HUD 宽度。
-pub const HUD_WIDTH_DUAL: f32 = 820.0;
+/// 配置界面宽度（高度按内容自适应）。
+pub const CONFIG_WIDTH: f32 = 360.0;
+/// 配置界面最小高度。
+pub const CONFIG_MIN_HEIGHT: f32 = 200.0;
+// HUD（运行界面）尺寸不再用固定常量：由 task_view 测量内容后自适应。
 
 /// 进入彩虹变色提醒的剩余秒数阈值。
 pub const RAINBOW_THRESHOLD_SECS: i64 = 120;

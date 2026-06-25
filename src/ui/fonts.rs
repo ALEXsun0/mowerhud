@@ -8,11 +8,21 @@ use std::sync::Arc;
 pub fn setup_chinese_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
 
-    // Windows 系统字体路径，按优先级尝试
+    // 各平台常见中文字体路径，按优先级尝试，命中一个即可
     let font_paths = [
+        // Windows
         "C:\\Windows\\Fonts\\msyh.ttc",   // 微软雅黑
         "C:\\Windows\\Fonts\\simhei.ttf", // 黑体
         "C:\\Windows\\Fonts\\simsun.ttc", // 宋体
+        // macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        // Linux（Noto / 文泉驿等）
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
     ];
 
     for font_path in font_paths {

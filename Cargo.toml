@@ -3,15 +3,24 @@ name = "mowerhud"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# 默认带 TLS（HTTPS）。若只连 localhost 的 http，可用
+# `cargo build --release --no-default-features` 去掉整套 rustls + aws-lc-rs，
+# 进一步缩小体积；此时配置里的 https 选项将无法使用。
+default = ["tls"]
+tls = ["reqwest/rustls", "dep:aws-lc-rs"]
+
 [dependencies]
-# 最小化 reqwest features：只需要 JSON 和 rustls-tls (比 native-tls 小)
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# 最小化 reqwest features：只需 JSON；TLS（rustls）由 `tls` feature 提供
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # 最小化 tokio features：只需要运行时、宏和时间
 tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
-# 使用最小化的 eframe features - 禁用所有不需要的平台代码
-eframe = { version = "0.34", default-features = false, features = ["glow"] }
+# wgpu 后端（DX12/Vulkan，DXGI flip-model 呈现）替代 glow(OpenGL)：
+# 无边框置顶窗口在 OpenGL 旧式 SwapBuffers 路径下每次出图会整窗黑/白闪，
+# DXGI flip-model 呈现干净，无此问题。
+eframe = { version = "0.34", default-features = false, features = ["wgpu"] }
 egui = { version = "0.34", default-features = false }
 # 最小化 chrono：只需要时钟功能，禁用所有其他
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -19,17 +28,32 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 notify-rust = { version = "4.18", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "windef", "utilapiset"] }
+# 固定 windows / windows-core 到同一 0.62.0：wgpu-hal 29 要求 "0.62"，但解析器会拉到
+# windows-core 0.62.2（imp trait 变更）与 windows 0.62.0 错位导致编译失败；锁死对齐即可。
+windows = { version = "=0.62.0", default-features = false }
+windows-core = { version = "=0.62.0", default-features = false }
+# iphlpapi/tcpmib/ws2def 用于枚举本机监听端口，自动发现本地 Mower 实例
+winapi = { version = "0.3", features = [
+    "winuser",
+    "windef",
+    "utilapiset",
+    "iphlpapi",
+    "tcpmib",
+    "ws2def",
+] }
 # 启用 aws-lc-rs（reqwest 的 rustls 后端）预构建的 NASM 汇编对象，
 # 免去在 Windows 上安装 NASM 的需求，从而省掉 CI 里的 setup-nasm 步骤。
-aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
+# 随 `tls` feature 启用；--no-default-features 时不编译它。
+aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"], optional = true }
+# 隐身模式的系统托盘图标（仅 Windows）。
+tray-icon = "0.19"
 
 # Linux 下 notify-rust 需要一个通知后端（zbus，纯 Rust）。
 # 用 target 专属依赖只在 Linux 启用，保持 Windows/macOS 构建最小化。
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = { version = "4.18", default-features = false, features = ["z"] }
 # winit 在 Linux 上需要一个窗口后端（x11/wayland），仅 Linux 启用。
-eframe = { version = "0.34", default-features = false, features = ["x11", "wayland"] }
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "x11", "wayland"] }
 
 # 优化编译配置以最小化体积
 [profile.release]

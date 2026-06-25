@@ -5,6 +5,35 @@ use std::fs::{read_to_string, write};
 
 const CONFIG_FILE: &str = "mower_config.json";
 
+/// HUD 展示模式。
+///
+/// 注意：序列化用的是**变体名**（serde 默认），故枚举顺序可自由调整、不影响旧配置读取；
+/// `as u8`（0/1/2/3）仅用于托盘内部传递当前模式，与持久化无关。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// 普通：当前 + 下一个任务（双列）。
+    #[default]
+    Normal,
+    /// 单列：同普通，但只留当前任务这一列，不展示下一个。
+    NormalSingle,
+    /// 隐身：隐藏窗口，只留托盘图标。
+    Stealth,
+}
+
+/// 容错地反序列化展示模式：未知值（含已删除的旧 "Simple"）一律回退普通，
+/// 避免旧配置因为某个字段不认识就整份读取失败、连带丢掉地址/端口等设置。
+fn deserialize_display_mode<'de, D>(d: D) -> Result<DisplayMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    Ok(match s.as_str() {
+        "NormalSingle" => DisplayMode::NormalSingle,
+        "Stealth" => DisplayMode::Stealth,
+        _ => DisplayMode::Normal,
+    })
+}
+
 /// API 连接配置。
 ///
 /// 注意：`password` 以明文形式存盘到 [`CONFIG_FILE`]，仅适合本地可信环境使用。
@@ -15,12 +44,23 @@ pub struct Config {
     pub use_https: bool,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Mower 自带的 token 鉴权（作为 HTTP 头 `token` 发送）。缺省即不发送。
+    #[serde(default)]
+    pub token: Option<String>,
     /// 是否发送桌面通知。`#[serde(default)]` 保证旧配置文件缺字段时回退到 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
     /// 是否播放提示音。
     #[serde(default = "default_true")]
     pub sound_enabled: bool,
+    /// 上次窗口左上角位置（逻辑像素），用于跨重启保持位置。缺省即不指定。
+    #[serde(default)]
+    pub window_x: Option<f32>,
+    #[serde(default)]
+    pub window_y: Option<f32>,
+    /// HUD 展示模式（普通/单列/隐身）。容错读取：未知值回退普通。
+    #[serde(default, deserialize_with = "deserialize_display_mode")]
+    pub display_mode: DisplayMode,
 }
 
 fn default_true() -> bool {
@@ -35,8 +75,12 @@ impl Default for Config {
             use_https: false,
             username: None,
             password: None,
+            token: None,
             notify_enabled: true,
             sound_enabled: true,
+            window_x: None,
+            window_y: None,
+            display_mode: DisplayMode::Normal,
         }
     }
 }

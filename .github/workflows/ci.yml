@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -68,6 +69,8 @@ jobs:
     name: release (${{ matrix.os }})
     needs: [fmt, test]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # 推 v* tag 时创建 GitHub Release 并上传二进制
     strategy:
       fail-fast: false
       matrix:
@@ -75,12 +78,15 @@ jobs:
           - os: ubuntu-latest
             artifact: mowerhud-linux
             bin: target/release/mowerhud
+            asset: mowerhud-linux
           - os: windows-latest
             artifact: mowerhud-windows
             bin: target/release/mowerhud.exe
+            asset: mowerhud-windows.exe
           - os: macos-latest
             artifact: mowerhud-macos
             bin: target/release/mowerhud
+            asset: mowerhud-macos
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -112,3 +118,18 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.bin }}
           if-no-files-found: error
+
+      # 仅当推送 v* tag 时：把本平台二进制改成带平台名的文件，发布到该 tag 的 GitHub Release。
+      # 三个平台的 job 各自把自己的产物上传到同一个 Release（softprops 会合并）。
+      - name: Stage release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: cp "${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true

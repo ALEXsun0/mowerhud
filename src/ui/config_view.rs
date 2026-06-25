@@ -1,11 +1,14 @@
-//! 配置界面：填写地址 / Basic 认证，测试连接并保存启动。
+//! 配置界面：自动发现 / 填写地址 / 鉴权，测试连接并保存启动。
 
 use crate::app::{AppState, MowerHUD};
+use crate::config::DisplayMode;
+use crate::discovery::ScanState;
 
-pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
+/// 绘制配置界面，返回内容实际高度（供外层把窗口高度调整到刚好容纳内容）。
+pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
     let ctx = ui.ctx().clone();
 
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    let resp = egui::CentralPanel::default().show_inside(ui, |ui| {
         let left_margin = 20.0;
 
         // 顶部控制栏（可拖动）
@@ -36,13 +39,9 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
-                    // 关闭按钮
+                    // 关闭按钮（不放最小化：无任务栏/不进 Alt-Tab 的窗口最小化后无法找回）
                     if ui.add_sized([30.0, 20.0], egui::Button::new("X")).clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    // 最小化按钮
-                    if ui.add_sized([30.0, 20.0], egui::Button::new("—")).clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                 });
             });
@@ -91,10 +90,85 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
 
         ui.add_space(10.0);
 
-        // Basic 认证
+        // 自动发现的本地 Mower 实例
         ui.horizontal(|ui| {
             ui.add_space(left_margin);
-            ui.label("Basic认证（可选）");
+            ui.label("本地 Mower:");
+            if ui
+                .add_sized([70.0, 18.0], egui::Button::new("重新扫描"))
+                .clicked()
+            {
+                app.start_scan();
+            }
+        });
+        ui.add_space(4.0);
+
+        // 克隆出扫描结果后立即释放锁，避免渲染期间持锁
+        let scan = app.scan_state.try_lock().ok().map(|g| g.clone());
+        match scan {
+            Some(ScanState::Scanning) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(left_margin);
+                    ui.spinner();
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new("正在扫描本地端口...")
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+            }
+            Some(ScanState::Done(list)) if !list.is_empty() => {
+                // 实例较多时滚动，保持窗口高度有界
+                egui::ScrollArea::vertical()
+                    .id_salt("mower_scan_list")
+                    .max_height(84.0)
+                    .show(ui, |ui| {
+                        for inst in &list {
+                            let mut label = format!("127.0.0.1:{}", inst.port);
+                            let st = inst.status.label();
+                            if !st.is_empty() {
+                                label.push_str(" · ");
+                                label.push_str(st);
+                            }
+                            if let Some(t) = &inst.next_task_time {
+                                // 只取时间部分，避免按钮过宽
+                                let short = t.rsplit(' ').next().unwrap_or(t);
+                                label.push_str(" · 下个 ");
+                                label.push_str(short);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add_space(left_margin);
+                                if ui
+                                    .add_sized([290.0, 20.0], egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    app.temp_address = format!("127.0.0.1:{}", inst.port);
+                                    app.temp_use_https = false;
+                                }
+                            });
+                        }
+                    });
+            }
+            Some(ScanState::Done(_)) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(left_margin);
+                    ui.label(
+                        egui::RichText::new("未发现本地 Mower（可手动填写）")
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+            }
+            None => {}
+        }
+
+        ui.add_space(10.0);
+
+        // 鉴权（可选）：Token 为 Mower 自带，用户名/密码为反向代理的 Basic 认证
+        ui.horizontal(|ui| {
+            ui.add_space(left_margin);
+            ui.label("鉴权（可选）");
         });
 
         ui.add_space(6.0);
@@ -117,6 +191,15 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
                             .desired_width(258.0),
                     );
                     ui.end_row();
+
+                    ui.label("Token:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.temp_token)
+                            .password(true)
+                            .hint_text("Mower 远程连接密钥")
+                            .desired_width(258.0),
+                    );
+                    ui.end_row();
                 });
         });
 
@@ -128,6 +211,26 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
             ui.checkbox(&mut app.temp_notify_enabled, "启用通知");
             ui.add_space(15.0);
             ui.checkbox(&mut app.temp_sound_enabled, "启用提示音");
+        });
+
+        ui.add_space(8.0);
+
+        // 展示模式：普通 / 单列 / 隐身（也可在运行界面右键切换）
+        ui.horizontal(|ui| {
+            ui.add_space(left_margin);
+            ui.label("展示模式:");
+            for (mode, label) in [
+                (DisplayMode::Normal, "普通"),
+                (DisplayMode::NormalSingle, "单列"),
+                (DisplayMode::Stealth, "隐身"),
+            ] {
+                if ui
+                    .selectable_label(app.display_mode == mode, label)
+                    .clicked()
+                {
+                    app.set_display_mode(mode);
+                }
+            }
         });
 
         ui.add_space(12.0);
@@ -163,5 +266,9 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) {
                 app.start_task_fetching();
             }
         });
+
+        // 返回内容已占用的高度，供外层自适应窗口高度
+        ui.min_rect().height()
     });
+    resp.inner
 }
