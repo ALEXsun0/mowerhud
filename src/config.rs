@@ -1,0 +1,166 @@
+//! API 连接配置：结构定义、文件读写、以及从输入文本解析配置。
+
+use serde::{Deserialize, Serialize};
+use std::fs::{read_to_string, write};
+
+const CONFIG_FILE: &str = "mower_config.json";
+
+/// API 连接配置。
+///
+/// 注意：`password` 以明文形式存盘到 [`CONFIG_FILE`]，仅适合本地可信环境使用。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Config {
+    pub host: String,
+    pub port: u16,
+    pub use_https: bool,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// 是否发送桌面通知。`#[serde(default)]` 保证旧配置文件缺字段时回退到 true。
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
+    /// 是否播放提示音。
+    #[serde(default = "default_true")]
+    pub sound_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 3289,
+            use_https: false,
+            username: None,
+            password: None,
+            notify_enabled: true,
+            sound_enabled: true,
+        }
+    }
+}
+
+impl Config {
+    /// 从 `host` 或 `host:port` 文本解析出配置。地址为空时回退到 `127.0.0.1`。
+    pub fn from_address(
+        address: &str,
+        use_https: bool,
+        username: &str,
+        password: &str,
+    ) -> Result<Config, String> {
+        let address = address.trim();
+        let address = if address.is_empty() {
+            "127.0.0.1"
+        } else {
+            address
+        };
+
+        let parts: Vec<&str> = address.split(':').collect();
+        let (host, port) = match parts.len() {
+            // 只有主机名，按协议选择默认端口
+            1 => {
+                let default_port = if use_https { 443 } else { 80 };
+                (parts[0].trim().to_string(), default_port)
+            }
+            // 标准 host:port
+            2 => {
+                let host = parts[0].trim().to_string();
+                let port = parts[1]
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "端口号格式错误".to_string())?;
+                (host, port)
+            }
+            _ => return Err("地址格式错误，应为 host 或 host:port".to_string()),
+        };
+
+        if host.is_empty() {
+            return Err("主机地址不能为空".to_string());
+        }
+
+        Ok(Config {
+            host,
+            port,
+            use_https,
+            username: (!username.is_empty()).then(|| username.to_string()),
+            password: (!password.is_empty()).then(|| password.to_string()),
+            // 提醒开关由调用方在解析后单独设置，这里取默认值
+            ..Config::default()
+        })
+    }
+
+    /// 返回不含路径的基础 URL，例如 `http://127.0.0.1:3289`。
+    pub fn base_url(&self) -> String {
+        let protocol = if self.use_https { "https" } else { "http" };
+        format!("{}://{}:{}", protocol, self.host, self.port)
+    }
+}
+
+pub fn save_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(config)?;
+    write(CONFIG_FILE, json)?;
+    Ok(())
+}
+
+pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+    let json = read_to_string(CONFIG_FILE)?;
+    let config: Config = serde_json::from_str(&json)?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_host_only_with_default_http_port() {
+        let c = Config::from_address("192.168.1.10", false, "", "").unwrap();
+        assert_eq!(c.host, "192.168.1.10");
+        assert_eq!(c.port, 80);
+        assert!(c.username.is_none());
+    }
+
+    #[test]
+    fn parses_host_and_port() {
+        let c = Config::from_address("127.0.0.1:3289", false, "u", "p").unwrap();
+        assert_eq!(c.port, 3289);
+        assert_eq!(c.username.as_deref(), Some("u"));
+        assert_eq!(c.password.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn empty_address_falls_back_to_localhost() {
+        let c = Config::from_address("  ", true, "", "").unwrap();
+        assert_eq!(c.host, "127.0.0.1");
+        assert_eq!(c.port, 443); // https 默认端口
+    }
+
+    #[test]
+    fn rejects_bad_port() {
+        assert!(Config::from_address("127.0.0.1:abc", false, "", "").is_err());
+    }
+
+    #[test]
+    fn base_url_uses_protocol() {
+        let c = Config::from_address("h:1", true, "", "").unwrap();
+        assert_eq!(c.base_url(), "https://h:1");
+    }
+
+    #[test]
+    fn from_address_defaults_alerts_on() {
+        let c = Config::from_address("h:1", false, "", "").unwrap();
+        assert!(c.notify_enabled);
+        assert!(c.sound_enabled);
+    }
+
+    #[test]
+    fn old_config_without_alert_fields_defaults_to_true() {
+        // 模拟旧版本写出的、不含 notify_enabled/sound_enabled 的配置文件
+        let json =
+            r#"{"host":"127.0.0.1","port":3289,"use_https":false,"username":null,"password":null}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert!(c.notify_enabled);
+        assert!(c.sound_enabled);
+    }
+}

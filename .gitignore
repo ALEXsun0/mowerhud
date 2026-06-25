@@ -1,0 +1,6 @@
+# Rust build artifacts
+/target
+
+# Backup/temp files
+**/*.rs.bk
+*.pdb

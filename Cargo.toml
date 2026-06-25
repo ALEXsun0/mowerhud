@@ -1,0 +1,39 @@
+[package]
+name = "mowerhud"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 最小化 reqwest features：只需要 JSON 和 rustls-tls (比 native-tls 小)
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 最小化 tokio features：只需要运行时、宏和时间
+tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+# 使用最小化的 eframe features - 禁用所有不需要的平台代码
+eframe = { version = "0.34", default-features = false, features = ["glow"] }
+egui = { version = "0.34", default-features = false }
+# 最小化 chrono：只需要时钟功能，禁用所有其他
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 最小化 notify-rust：禁用异步和不必要的依赖
+notify-rust = { version = "4.18", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "windef", "utilapiset"] }
+
+# Linux 下 notify-rust 需要一个通知后端（zbus，纯 Rust）。
+# 用 target 专属依赖只在 Linux 启用，保持 Windows/macOS 构建最小化。
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
+# winit 在 Linux 上需要一个窗口后端（x11/wayland），仅 Linux 启用。
+eframe = { version = "0.34", default-features = false, features = ["x11", "wayland"] }
+
+# 优化编译配置以最小化体积
+[profile.release]
+opt-level = "z"          # 优化体积而不是速度
+lto = "fat"              # 完整 LTO，最激进的链接时优化
+codegen-units = 1        # 单个代码生成单元以获得更好的优化
+panic = "abort"          # panic 时直接中止，不展开堆栈（减小体积）
+strip = true             # 自动去除符号和调试信息
+overflow-checks = false  # 禁用溢出检查以减小体积
+incremental = false      # 禁用增量编译，允许更好的优化
