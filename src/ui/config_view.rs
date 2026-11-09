@@ -51,9 +51,9 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
 
         // 标题区域
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("API配置").size(16.0).strong());
+            ui.label(egui::RichText::new("连接设置").size(16.0).strong());
             ui.add_space(3.0);
-            ui.label("请配置API连接信息");
+            ui.label("选择本地实例，或手动填写连接信息");
         });
 
         ui.add_space(12.0);
@@ -76,13 +76,19 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
                             .clicked()
                         {
                             app.temp_use_https = !app.temp_use_https;
+                            app.cancel_auto_connect();
                         }
                         ui.label("://");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut app.temp_address)
-                                .hint_text("127.0.0.1 或 127.0.0.1:3289")
-                                .desired_width(190.0),
-                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut app.temp_address)
+                                    .hint_text("127.0.0.1 或 127.0.0.1:3289")
+                                    .desired_width(190.0),
+                            )
+                            .changed()
+                        {
+                            app.cancel_auto_connect();
+                        }
                     });
                     ui.end_row();
                 });
@@ -126,10 +132,20 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
                     .show(ui, |ui| {
                         for inst in &list {
                             let mut label = format!("127.0.0.1:{}", inst.port);
+                            if !inst.name.is_empty() {
+                                label.push_str(" · ");
+                                label.push_str(&inst.name);
+                            }
+                            if inst.local_id.is_some() {
+                                label.push_str(" · 无需 Token");
+                            }
                             let st = inst.status.label();
                             if !st.is_empty() {
                                 label.push_str(" · ");
                                 label.push_str(st);
+                            }
+                            if inst.requires_token {
+                                label.push_str(" · 需要 Token");
                             }
                             if let Some(t) = &inst.next_task_time {
                                 // 只取时间部分，避免按钮过宽
@@ -143,8 +159,11 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
                                     .add_sized([290.0, 20.0], egui::Button::new(label))
                                     .clicked()
                                 {
-                                    app.temp_address = format!("127.0.0.1:{}", inst.port);
-                                    app.temp_use_https = false;
+                                    app.select_instance(inst);
+                                    if inst.local_id.is_some() && app.save_and_start() {
+                                        app.state = AppState::Running;
+                                        app.start_task_fetching();
+                                    }
                                 }
                             });
                         }
@@ -154,7 +173,7 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
                 ui.horizontal(|ui| {
                     ui.add_space(left_margin);
                     ui.label(
-                        egui::RichText::new("未发现本地 Mower（可手动填写）")
+                        egui::RichText::new("未发现本地实例，可手动填写地址")
                             .size(11.0)
                             .color(egui::Color32::GRAY),
                     );
@@ -165,10 +184,10 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
 
         ui.add_space(10.0);
 
-        // 鉴权（可选）：Token 为 Mower 自带，用户名/密码为反向代理的 Basic 认证
+        // Token 为 Mower 自带，用户名/密码为反向代理的 Basic 认证
         ui.horizontal(|ui| {
             ui.add_space(left_margin);
-            ui.label("鉴权（可选）");
+            ui.label("手动连接鉴权");
         });
 
         ui.add_space(6.0);
@@ -181,24 +200,41 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
                 .striped(false)
                 .show(ui, |ui| {
                     ui.label("用户名:");
-                    ui.add(egui::TextEdit::singleline(&mut app.temp_username).desired_width(258.0));
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut app.temp_username).desired_width(258.0),
+                        )
+                        .changed()
+                    {
+                        app.cancel_auto_connect();
+                    }
                     ui.end_row();
 
                     ui.label("密码:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.temp_password)
-                            .password(true)
-                            .desired_width(258.0),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut app.temp_password)
+                                .password(true)
+                                .desired_width(258.0),
+                        )
+                        .changed()
+                    {
+                        app.cancel_auto_connect();
+                    }
                     ui.end_row();
 
                     ui.label("Token:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.temp_token)
-                            .password(true)
-                            .hint_text("Mower 远程连接密钥")
-                            .desired_width(258.0),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut app.temp_token)
+                                .password(true)
+                                .hint_text("Mower 实例 Token")
+                                .desired_width(258.0),
+                        )
+                        .changed()
+                    {
+                        app.cancel_auto_connect();
+                    }
                     ui.end_row();
                 });
         });

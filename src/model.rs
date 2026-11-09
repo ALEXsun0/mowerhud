@@ -11,17 +11,34 @@ pub enum MowerStatus {
     Sleeping,
     /// mower 正在执行任务。
     Working,
+    /// mower 正在启动或等待初始化完成。
+    Starting,
+    /// 设备正在恢复或暂停后等待恢复。
+    Recovering,
     /// 还未取得状态（启动初期）。
     Unknown,
 }
 
 impl MowerStatus {
+    pub fn from_api(value: &str) -> Self {
+        match value {
+            "stopped" => Self::Stopped,
+            "sleeping" => Self::Sleeping,
+            "working" => Self::Working,
+            "starting" => Self::Starting,
+            "recovering" => Self::Recovering,
+            _ => Self::Unknown,
+        }
+    }
+
     /// 用于角标展示的中文标签；`Unknown` 返回空串表示不展示。
     pub fn label(self) -> &'static str {
         match self {
             MowerStatus::Stopped => "已停止",
             MowerStatus::Sleeping => "休眠中",
             MowerStatus::Working => "运行中",
+            MowerStatus::Starting => "启动中",
+            MowerStatus::Recovering => "恢复中",
             MowerStatus::Unknown => "",
         }
     }
@@ -56,8 +73,8 @@ pub fn calculate_countdown_with_status(target_time: &DateTime<Local>) -> (String
     let remaining_secs = duration.num_seconds();
 
     if remaining_secs <= 0 {
-        // 已过期，只显示“执行中”，不显示已执行时间
-        ("执行中".to_string(), true, remaining_secs)
+        // 队列接口未提供当前执行项，时间已到不代表该项一定正在执行。
+        ("已到期".to_string(), true, remaining_secs)
     } else {
         let hours = duration.num_hours();
         let minutes = duration.num_minutes() % 60;
@@ -67,5 +84,18 @@ pub fn calculate_countdown_with_status(target_time: &DateTime<Local>) -> (String
             false,
             remaining_secs,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overdue_queued_task_does_not_claim_to_be_executing() {
+        let time = Local::now() - chrono::Duration::minutes(2);
+        let (label, expired, _) = calculate_countdown_with_status(&time);
+        assert!(expired);
+        assert_eq!(label, "已到期");
     }
 }

@@ -47,6 +47,12 @@ pub struct Config {
     /// Mower 自带的 token 鉴权（作为 HTTP 头 `token` 发送）。缺省即不发送。
     #[serde(default)]
     pub token: Option<String>,
+    /// 本地只读服务的稳定实例标识；缺省时使用普通 HTTP 连接。
+    #[serde(default)]
+    pub local_instance_id: Option<String>,
+    /// 最近一次发现的本地服务端口，失效时会重新扫描。
+    #[serde(default)]
+    pub local_hud_port: Option<u16>,
     /// 是否发送桌面通知。`#[serde(default)]` 保证旧配置文件缺字段时回退到 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
@@ -76,6 +82,8 @@ impl Default for Config {
             username: None,
             password: None,
             token: None,
+            local_instance_id: None,
+            local_hud_port: None,
             notify_enabled: true,
             sound_enabled: true,
             window_x: None,
@@ -86,6 +94,15 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn auto_connect_to_local(&self, first_start: bool) -> bool {
+        self.local_instance_id.is_some()
+            || first_start
+            || (matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+                && !self.use_https
+                && self.username.is_none()
+                && self.password.is_none())
+    }
+
     /// 从 `host` 或 `host:port` 文本解析出配置。地址为空时回退到 `127.0.0.1`。
     pub fn from_address(
         address: &str,
@@ -206,5 +223,19 @@ mod tests {
         let c: Config = serde_json::from_str(json).unwrap();
         assert!(c.notify_enabled);
         assert!(c.sound_enabled);
+    }
+
+    #[test]
+    fn local_autoconnect_preserves_explicit_remote_and_proxy_settings() {
+        let mut c = Config::default();
+        assert!(c.auto_connect_to_local(false));
+        c.host = "remote.example".into();
+        assert!(!c.auto_connect_to_local(false));
+        c.host = "127.0.0.1".into();
+        c.username = Some("proxy-user".into());
+        assert!(!c.auto_connect_to_local(false));
+        c.username = None;
+        c.use_https = true;
+        assert!(!c.auto_connect_to_local(false));
     }
 }

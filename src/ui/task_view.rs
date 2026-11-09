@@ -105,8 +105,9 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> egui::Vec2 {
             }
             bg.context_menu(|ui| context_menu(ui, &ctx, app));
 
-            // mower 已停止：明确提示，而不是含糊的“没有找到任务”
-            if status == MowerStatus::Stopped {
+            let error_msg = app.task_error.try_lock().ok().and_then(|g| g.clone());
+            // 状态获取失败时，不能把缓存的“已停止”当成当前状态。
+            if status == MowerStatus::Stopped && error_msg.is_none() {
                 return show_message_row(
                     ui,
                     &ctx,
@@ -116,7 +117,6 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> egui::Vec2 {
                 );
             }
 
-            let error_msg = app.task_error.try_lock().ok().and_then(|g| g.clone());
             let offline = error_msg.is_some();
             // 克隆任务快照后立即释放锁，便于按模式分函数渲染（且不在渲染期持锁）
             let task = app.task_info.try_lock().ok().and_then(|g| g.clone());
@@ -137,10 +137,11 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> egui::Vec2 {
                     egui::Color32::from_rgb(255, 150, 150),
                 );
             }
-            let text = if status == MowerStatus::Unknown {
-                "正在加载任务数据..."
-            } else {
-                "暂无任务"
+            let text = match status {
+                MowerStatus::Unknown => "正在加载任务数据...",
+                MowerStatus::Starting => "Mower 启动中",
+                MowerStatus::Recovering => "Mower 恢复中",
+                _ => "暂无任务",
             };
             show_message_row(ui, &ctx, app, text, egui::Color32::GRAY)
         });
@@ -239,7 +240,7 @@ fn render_normal(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
                     let (task_status, task_color) = if task.is_expired {
-                        ("执行中", egui::Color32::from_rgb(100, 200, 100))
+                        ("已到期", egui::Color32::from_rgb(255, 180, 120))
                     } else {
                         ("待执行", egui::Color32::from_rgb(150, 150, 255))
                     };
