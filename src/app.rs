@@ -2,7 +2,7 @@
 
 use crate::api;
 use crate::config::{Config, DisplayMode, load_config, save_config};
-use crate::discovery::{self, ScanState};
+use crate::discovery::{self, MowerInstance, ScanState};
 use crate::model::{MowerStatus, TaskInfo, calculate_countdown_with_status};
 use crate::notify::{play_beep_sound, send_notification};
 use crate::ui;
@@ -57,6 +57,10 @@ pub struct MowerHUD {
     pub connection_status: Arc<Mutex<String>>,
     /// 本地 Mower 自动发现的结果。
     pub scan_state: Arc<Mutex<ScanState>>,
+    pub selected_local: Option<MowerInstance>,
+    auto_connect_pending: bool,
+    auto_select_single: bool,
+    next_auto_scan: Instant,
     pub always_on_top: bool,
     // 通知状态
     pub notified_2min: bool,
@@ -88,7 +92,11 @@ impl MowerHUD {
         cc.egui_ctx
             .all_styles_mut(|s| s.interaction.selectable_labels = false);
 
-        let config = load_config().unwrap_or_default();
+        let stored_config = load_config().ok();
+        let first_start = stored_config.is_none();
+        let config = stored_config.unwrap_or_default();
+        let auto_connect_pending = config.auto_connect_to_local(first_start);
+        let auto_select_single = auto_connect_pending && config.local_instance_id.is_none();
         let config_display_mode = config.display_mode;
 
         // 共享状态先建出来，好同时交给结构体和托盘线程（托盘需要读状态文本）。
@@ -120,6 +128,10 @@ impl MowerHUD {
             last_update: Instant::now(),
             connection_status: Arc::new(Mutex::new(String::new())),
             scan_state: Arc::new(Mutex::new(ScanState::Scanning)),
+            selected_local: None,
+            auto_connect_pending,
+            auto_select_single,
+            next_auto_scan: Instant::now() + Duration::from_secs(5),
             always_on_top: true,
             notified_2min: false,
             notified_30sec: false,
@@ -160,6 +172,45 @@ impl MowerHUD {
                 *guard = ScanState::Done(found);
             }
         });
+    }
+
+    pub fn cancel_auto_connect(&mut self) {
+        self.auto_connect_pending = false;
+    }
+
+    pub fn select_instance(&mut self, instance: &MowerInstance) {
+        self.cancel_auto_connect();
+        self.temp_address = format!("127.0.0.1:{}", instance.port);
+        self.temp_use_https = false;
+        if instance.local_id.is_some() && instance.local_port.is_some() {
+            self.temp_username.clear();
+            self.temp_password.clear();
+            self.temp_token.clear();
+            self.selected_local = Some(instance.clone());
+        } else {
+            self.selected_local = None;
+        }
+    }
+
+    fn try_auto_connect(&mut self) {
+        if !self.auto_connect_pending || !matches!(self.state, AppState::Configuration) {
+            return;
+        }
+        let scan = self.scan_state.try_lock().ok().map(|state| state.clone());
+        if let Some(ScanState::Done(instances)) = scan {
+            if let Some(instance) =
+                discovery::auto_select(&self.config, self.auto_select_single, &instances)
+            {
+                self.select_instance(instance);
+                if self.save_and_start() {
+                    self.state = AppState::Running;
+                    self.start_task_fetching();
+                }
+            } else if Instant::now() >= self.next_auto_scan {
+                self.start_scan();
+                self.next_auto_scan = Instant::now() + Duration::from_secs(5);
+            }
+        }
     }
 
     /// 当前 mower 状态（读不到锁时回退 `Unknown`）。
@@ -314,6 +365,16 @@ impl MowerHUD {
         config.sound_enabled = self.temp_sound_enabled;
         let token = self.temp_token.trim();
         config.token = (!token.is_empty()).then(|| token.to_string());
+        if let Some(instance) = &self.selected_local
+            && self.temp_address.trim() == format!("127.0.0.1:{}", instance.port)
+            && !self.temp_use_https
+            && config.username.is_none()
+            && config.password.is_none()
+            && config.token.is_none()
+        {
+            config.local_instance_id = instance.local_id.clone();
+            config.local_hud_port = instance.local_port;
+        }
         // 保留已记忆的窗口位置与展示模式（from_address 会重置为默认值）
         config.window_x = self.config.window_x;
         config.window_y = self.config.window_y;
@@ -463,6 +524,8 @@ impl eframe::App for MowerHUD {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         self.handle_tray_commands(ctx);
+
+        self.try_auto_connect();
 
         let interval_ms = match self.state {
             AppState::Configuration => {

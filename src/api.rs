@@ -25,6 +25,26 @@ struct Task {
     /// 房间 -> 干员列表；跑单任务用它定位贸易站。值的具体形状我们不关心。
     #[serde(default)]
     plan: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    presentation: Option<TaskPresentation>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct TaskPresentation {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    rooms: Vec<PresentationRoom>,
+    #[serde(default)]
+    targets: Vec<PresentationRoom>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct PresentationRoom {
+    id: String,
+    label: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -38,8 +58,41 @@ struct TaskType {
 /// `/status` 返回体 —— 只取 `status` 字段。
 #[derive(Deserialize, Debug)]
 struct StatusResponse {
-    #[serde(default)]
     status: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct LocalHudSnapshot {
+    protocol: String,
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    pub(crate) mower_port: u16,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) next_task_time: Option<String>,
+    tasks: Vec<Task>,
+}
+
+pub(crate) async fn fetch_local_snapshot(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<LocalHudSnapshot, BoxError> {
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/mowerhud"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let snapshot: LocalHudSnapshot = response.json().await?;
+    if snapshot.protocol != "mowerhud/1"
+        || snapshot.id.is_empty()
+        || snapshot.id.len() > 128
+        || snapshot.mower_port == 0
+        || snapshot.status.is_empty()
+    {
+        return Err("本地 MowerHUD 响应格式无效".into());
+    }
+    Ok(snapshot)
 }
 
 /// 构造带超时的客户端，避免挂死连接卡住整个轮询。
@@ -50,10 +103,19 @@ fn build_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+fn build_local_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// 构造 GET 请求，带上 Mower token（HTTP 头 `token`）与可选的 Basic 认证。
 ///
 /// token 是 Mower 自带的鉴权（`config.conf.webview.token`）；Basic 认证是给反向代理用的。
-/// 两者相互独立，可同时存在。`/status`、`/task` 本身不校验 token，多带也无害。
+/// 两者相互独立，可同时存在。alpha 的 `/status` 和 `/task` 均需要实例 token。
 fn authed_get(client: &reqwest::Client, config: &Config, path: &str) -> reqwest::RequestBuilder {
     let url = format!("{}{}", config.base_url(), path);
     let mut request = client.get(&url);
@@ -80,6 +142,17 @@ pub async fn fetch_state_loop(
     mower_status: Arc<Mutex<MowerStatus>>,
     config: Config,
 ) {
+    if let Some(id) = config.local_instance_id.clone() {
+        fetch_local_state_loop(
+            task_info,
+            task_error,
+            mower_status,
+            id,
+            config.local_hud_port,
+        )
+        .await;
+        return;
+    }
     let client = build_client();
     let mut interval = interval(Duration::from_secs(1));
 
@@ -103,7 +176,7 @@ pub async fn fetch_state_loop(
                     match fetch_earliest_task(&client, &config).await {
                         Ok(task) => {
                             if let Ok(mut guard) = task_info.lock() {
-                                *guard = Some(task);
+                                *guard = task;
                             }
                             if let Ok(mut guard) = task_error.lock() {
                                 *guard = None;
@@ -127,16 +200,81 @@ pub async fn fetch_state_loop(
     }
 }
 
+async fn fetch_local_state_loop(
+    task_info: Arc<Mutex<Option<TaskInfo>>>,
+    task_error: Arc<Mutex<Option<String>>>,
+    mower_status: Arc<Mutex<MowerStatus>>,
+    id: String,
+    mut port: Option<u16>,
+) {
+    let client = build_local_client();
+    let mut interval = interval(Duration::from_secs(1));
+    let mut next_scan = tokio::time::Instant::now();
+    loop {
+        interval.tick().await;
+        if port.is_none() && tokio::time::Instant::now() >= next_scan {
+            port = crate::discovery::scan_local_mowers()
+                .await
+                .into_iter()
+                .find(|instance| instance.local_id.as_deref() == Some(&id))
+                .and_then(|instance| instance.local_port);
+            next_scan = tokio::time::Instant::now() + Duration::from_secs(5);
+        }
+        let result = match port {
+            Some(current_port) => match fetch_local_snapshot(&client, current_port).await {
+                Ok(snapshot) if snapshot.id == id => {
+                    let status = MowerStatus::from_api(&snapshot.status);
+                    let task = if status == MowerStatus::Stopped {
+                        Ok(None)
+                    } else {
+                        task_info_from_tasks(snapshot.tasks)
+                    };
+                    task.map(|task| (status, task))
+                }
+                Ok(_) => Err("本地实例已改变，正在重新查找".into()),
+                Err(error) => Err(error),
+            },
+            None => Err("等待本地 Mower 实例".into()),
+        };
+        match result {
+            Ok((status, task)) => {
+                if let Ok(mut guard) = mower_status.lock() {
+                    *guard = status;
+                }
+                if let Ok(mut guard) = task_info.lock() {
+                    *guard = task;
+                }
+                if let Ok(mut guard) = task_error.lock() {
+                    *guard = None;
+                }
+            }
+            Err(error) => {
+                if port.take().is_some() {
+                    next_scan = tokio::time::Instant::now();
+                }
+                if let Ok(mut guard) = task_error.lock() {
+                    *guard = Some(error.to_string());
+                }
+            }
+        }
+    }
+}
+
 /// 拉取 mower 运行状态。
 async fn fetch_status(client: &reqwest::Client, config: &Config) -> Result<MowerStatus, BoxError> {
-    let response = authed_get(client, config, "/status").send().await?;
+    let response = checked_response(authed_get(client, config, "/status").send().await?)?;
     let status: StatusResponse = response.json().await?;
-    Ok(match status.status.as_str() {
-        "stopped" => MowerStatus::Stopped,
-        "sleeping" => MowerStatus::Sleeping,
-        "working" => MowerStatus::Working,
-        _ => MowerStatus::Unknown,
-    })
+    if status.status.is_empty() {
+        return Err("Mower 状态响应缺少状态".into());
+    }
+    Ok(MowerStatus::from_api(&status.status))
+}
+
+fn checked_response(response: reqwest::Response) -> Result<reqwest::Response, BoxError> {
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("Mower 拒绝访问，请检查实例 Token（HTTP 403）".into());
+    }
+    Ok(response.error_for_status()?)
 }
 
 /// 解析后端时间字符串为本地时间，尽量宽容以免静默丢任务。
@@ -146,7 +284,7 @@ fn parse_task_time(s: &str) -> Option<DateTime<Local>> {
         return Some(dt.with_timezone(&Local));
     }
     // 否则按朴素本地时间，允许有或没有小数秒。
-    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
             // DST 歧义时取较早的一个，而非像 .single() 那样直接丢弃。
             return Local.from_local_datetime(&naive).earliest();
@@ -155,13 +293,58 @@ fn parse_task_time(s: &str) -> Option<DateTime<Local>> {
     None
 }
 
-/// 任务展示名：镜像后端 `SchedulerTask.format()`，“空任务”用 `meta_data` 兜底。
+/// 优先使用 alpha 提供的展示快照，同时兼容旧版本的类型和元数据。
 fn task_label(task: &Task) -> String {
-    if task.task_type.display_value == "空任务" && !task.meta_data.is_empty() {
-        task.meta_data.clone()
-    } else {
-        task.task_type.display_value.clone()
+    let presentation = task.presentation.as_ref();
+    let mut title = presentation
+        .map(|p| p.title.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            task.display_name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(&task.task_type.display_value)
+        .to_string();
+    if task.task_type.display_value == "技能专精" || title == "技能专精" {
+        title = "自动专精".to_string();
+    } else if task.task_type.display_value == "换协助位" || title == "换协助位" {
+        title = "自动专精换协助位".to_string();
+    } else if title == "趴体" {
+        title = "线索交流".to_string();
+    } else if title == "肥鸭" || title.starts_with("肥鸭 充 ") {
+        return "菲亚梅塔充能".to_string();
     }
+
+    let targets = presentation
+        .map(|p| {
+            p.targets
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        })
+        .filter(|s| !s.is_empty());
+    let target = targets.unwrap_or_else(|| {
+        if task.meta_data.starts_with("room_") || task.meta_data.starts_with("dormitory_") {
+            translate_room(&task.meta_data)
+        } else {
+            task.meta_data.clone()
+        }
+    });
+    if title == "空任务" && !target.is_empty() {
+        return target;
+    }
+    if task.plan.as_ref().is_none_or(|plan| plan.is_empty())
+        && !target.is_empty()
+        && title != target
+        && !title.ends_with(&format!(" {target}"))
+        && !title.ends_with(&format!("· {target}"))
+    {
+        title.push_str(" · ");
+        title.push_str(&target);
+    }
+    title
 }
 
 /// 把后端房间标识翻译成中文，镜像后端 `translate_room`。
@@ -202,7 +385,22 @@ fn run_order_rooms(task: &Task) -> Option<String> {
     if plan.is_empty() {
         return None;
     }
-    let rooms: Vec<String> = plan.keys().map(|r| translate_room(r)).collect();
+    let rooms: Vec<String> = plan
+        .keys()
+        .map(|room| {
+            task.presentation
+                .as_ref()
+                .and_then(|p| p.rooms.iter().find(|entry| entry.id == *room))
+                .map(|entry| {
+                    entry
+                        .label
+                        .strip_prefix("贸易站 ")
+                        .unwrap_or(&entry.label)
+                        .to_string()
+                })
+                .unwrap_or_else(|| translate_room(room))
+        })
+        .collect();
     Some(rooms.join("、"))
 }
 
@@ -210,14 +408,19 @@ fn run_order_rooms(task: &Task) -> Option<String> {
 async fn fetch_earliest_task(
     client: &reqwest::Client,
     config: &Config,
-) -> Result<TaskInfo, BoxError> {
-    let response = authed_get(client, config, "/task").send().await?;
+) -> Result<Option<TaskInfo>, BoxError> {
+    let response = checked_response(authed_get(client, config, "/task").send().await?)?;
     let tasks: Vec<Task> = response.json().await?;
+    task_info_from_tasks(tasks)
+}
 
-    let now = Local::now();
+fn task_info_from_tasks(tasks: Vec<Task>) -> Result<Option<TaskInfo>, BoxError> {
+    if tasks.is_empty() {
+        return Ok(None);
+    }
 
     // 解析时间并保留有效任务
-    let mut parsed_tasks: Vec<(Task, DateTime<Local>)> = tasks
+    let parsed_tasks: Vec<(Task, DateTime<Local>)> = tasks
         .into_iter()
         .filter_map(|task| parse_task_time(&task.time).map(|t| (task, t)))
         .collect();
@@ -226,26 +429,14 @@ async fn fetch_earliest_task(
         return Err("没有找到有效任务".into());
     }
 
-    parsed_tasks.sort_by_key(|(_, time)| *time);
-
-    // 选择当前应展示的任务：
-    // - 有未过期任务且它前面有任务 → 展示前一个（执行中）
-    // - 有未过期任务且它是第一个 → 从第一个开始
-    // - 全部过期 → 展示最后一个（执行中）
-    let first_future_idx = parsed_tasks.iter().position(|(_, time)| time >= &now);
-    let current_index = match first_future_idx {
-        Some(future_idx) if future_idx > 0 => future_idx - 1,
-        Some(_) => 0,
-        None => parsed_tasks.len().saturating_sub(1),
-    };
-
-    let (current_task, current_time) = &parsed_tasks[current_index];
+    // Mower 队列本身反映优先级与保留中的任务，不能按时间重排或跳过逾期任务。
+    let (current_task, current_time) = &parsed_tasks[0];
     let (current_countdown, is_expired, remaining_secs) =
         calculate_countdown_with_status(current_time);
     let current_rooms = run_order_rooms(current_task);
 
     // 下一个任务：只要后面还有就展示
-    let next_task = parsed_tasks.get(current_index + 1).map(|(task, time)| {
+    let next_task = parsed_tasks.get(1).map(|(task, time)| {
         let (countdown, _, _) = calculate_countdown_with_status(time);
         NextTaskInfo {
             name: task_label(task),
@@ -254,7 +445,7 @@ async fn fetch_earliest_task(
         }
     });
 
-    Ok(TaskInfo {
+    Ok(Some(TaskInfo {
         current_name: task_label(current_task),
         current_time: *current_time,
         current_countdown,
@@ -262,16 +453,23 @@ async fn fetch_earliest_task(
         remaining_seconds: remaining_secs,
         current_rooms,
         next_task,
-    })
+    }))
 }
 
 /// 测试 API 连接是否可用。
 pub async fn test_api_connection(config: &Config) -> Result<(), BoxError> {
-    let client = build_client();
-    let response = authed_get(&client, config, "/status").send().await?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP错误: {}", response.status()).into())
+    if let Some(id) = &config.local_instance_id {
+        let port = config.local_hud_port.ok_or("尚未发现本地 Mower 服务")?;
+        let snapshot = fetch_local_snapshot(&build_local_client(), port).await?;
+        return if &snapshot.id == id {
+            Ok(())
+        } else {
+            Err("本地实例已改变".into())
+        };
     }
+    let client = build_client();
+    fetch_status(&client, config).await.map(|_| ())
 }
+
+#[cfg(test)]
+mod tests;

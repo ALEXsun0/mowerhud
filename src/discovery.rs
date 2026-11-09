@@ -1,7 +1,7 @@
 //! 自动发现本机运行的 Mower 实例。
 //!
-//! Mower 无 token 时监听一个**随机临时端口**（`bind(0)`），所以无法靠固定端口探测；
-//! 必须枚举本机正在监听的 TCP 端口，再逐个探测 `/status`（该接口不需要 token）。
+//! Mower 可能监听随机端口，先枚举监听端口，再探测 `/status`。
+//! alpha 的状态接口需要 token；遇到 403 时通过公开的首页识别实例，不发送任何凭据。
 
 use crate::model::MowerStatus;
 use std::time::Duration;
@@ -11,6 +11,10 @@ use std::time::Duration;
 pub struct MowerInstance {
     pub port: u16,
     pub status: MowerStatus,
+    pub requires_token: bool,
+    pub local_id: Option<String>,
+    pub local_port: Option<u16>,
+    pub name: String,
     /// 下个任务时间（来自 `/status`），用于在列表里区分多个实例。
     pub next_task_time: Option<String>,
 }
@@ -20,6 +24,26 @@ pub struct MowerInstance {
 pub enum ScanState {
     Scanning,
     Done(Vec<MowerInstance>),
+}
+
+pub(crate) fn auto_select<'a>(
+    config: &crate::config::Config,
+    auto_select_single: bool,
+    instances: &'a [MowerInstance],
+) -> Option<&'a MowerInstance> {
+    if let Some(id) = &config.local_instance_id {
+        return instances.iter().find(|instance| {
+            instance.local_id.as_ref() == Some(id) && instance.local_port.is_some()
+        });
+    }
+    if !auto_select_single {
+        return None;
+    }
+    let mut eligible = instances
+        .iter()
+        .filter(|instance| instance.local_id.is_some() && instance.local_port.is_some());
+    let only = eligible.next()?;
+    eligible.next().is_none().then_some(only)
 }
 
 /// `/status` 探测体：要求同时含 `status` 与 `plan_condition`，作为“这是 Mower”的特征，
@@ -33,21 +57,14 @@ struct StatusProbe {
     next_task_time: Option<String>,
 }
 
-fn parse_status(s: &str) -> MowerStatus {
-    match s {
-        "stopped" => MowerStatus::Stopped,
-        "sleeping" => MowerStatus::Sleeping,
-        "working" => MowerStatus::Working,
-        _ => MowerStatus::Unknown,
-    }
-}
-
 /// 扫描本机所有候选端口，返回确认是 Mower 的实例（按端口排序）。
 pub async fn scan_local_mowers() -> Vec<MowerInstance> {
     let ports = candidate_ports();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(400))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
@@ -63,21 +80,66 @@ pub async fn scan_local_mowers() -> Vec<MowerInstance> {
             found.push(instance);
         }
     }
-    found.sort_by_key(|i| i.port);
+    found.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then_with(|| right.local_port.is_some().cmp(&left.local_port.is_some()))
+    });
+    found.dedup_by_key(|instance| instance.port);
     found
 }
 
 /// 探测单个端口是否为 Mower。
 async fn probe(client: &reqwest::Client, port: u16) -> Option<MowerInstance> {
+    if let Ok(snapshot) = crate::api::fetch_local_snapshot(client, port).await {
+        return Some(MowerInstance {
+            port: snapshot.mower_port,
+            status: MowerStatus::from_api(&snapshot.status),
+            requires_token: false,
+            local_id: Some(snapshot.id),
+            local_port: Some(port),
+            name: snapshot.name,
+            next_task_time: snapshot.next_task_time,
+        });
+    }
     let url = format!("http://127.0.0.1:{}/status", port);
     let response = client.get(&url).send().await.ok()?;
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        let index = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .ok()?;
+        if !index.status().is_success()
+            || !index
+                .text()
+                .await
+                .ok()?
+                .contains("<title>arknights-mower</title>")
+        {
+            return None;
+        }
+        return Some(MowerInstance {
+            port,
+            status: MowerStatus::Unknown,
+            requires_token: true,
+            local_id: None,
+            local_port: None,
+            name: String::new(),
+            next_task_time: None,
+        });
+    }
     if !response.status().is_success() {
         return None;
     }
     let probe: StatusProbe = response.json().await.ok()?;
     Some(MowerInstance {
         port,
-        status: parse_status(&probe.status),
+        status: MowerStatus::from_api(&probe.status),
+        requires_token: false,
+        local_id: None,
+        local_port: None,
+        name: String::new(),
         next_task_time: probe.next_task_time,
     })
 }
@@ -235,6 +297,115 @@ fn parse_lsof(text: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn local_instance(id: &str, port: u16) -> super::MowerInstance {
+        super::MowerInstance {
+            port,
+            status: crate::model::MowerStatus::Sleeping,
+            requires_token: false,
+            local_id: Some(id.to_string()),
+            local_port: Some(port + 100),
+            name: String::new(),
+            next_task_time: None,
+        }
+    }
+
+    #[test]
+    fn automatically_selects_only_a_unique_or_previously_chosen_instance() {
+        let mut config = crate::config::Config::default();
+        let instances = vec![local_instance("one", 1000), local_instance("two", 2000)];
+        assert!(super::auto_select(&config, true, &instances).is_none());
+        assert_eq!(
+            super::auto_select(&config, true, &instances[..1])
+                .unwrap()
+                .local_id
+                .as_deref(),
+            Some("one")
+        );
+        assert!(super::auto_select(&config, false, &instances[..1]).is_none());
+        config.local_instance_id = Some("two".into());
+        assert_eq!(
+            super::auto_select(&config, false, &instances)
+                .unwrap()
+                .local_id
+                .as_deref(),
+            Some("two")
+        );
+        config.local_instance_id = Some("missing".into());
+        assert!(super::auto_select(&config, false, &instances).is_none());
+    }
+
+    fn protected_server(index: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (path, status, body) in [
+                ("/mowerhud", 404, "Not Found"),
+                ("/status", 403, "Forbidden"),
+                ("/", 200, index),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(&format!("get {path} ")));
+                assert!(!request.lines().any(|line| line.starts_with("token:")));
+                write!(socket, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn discovers_local_read_only_hud_service_without_a_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let count = socket.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+            assert!(request.starts_with("get /mowerhud "));
+            assert!(!request.lines().any(|line| line.starts_with("token:")));
+            let body = r#"{"protocol":"mowerhud/1","id":"test-instance","name":"测试","mower_port":58000,"status":"sleeping","next_task_time":null,"tasks":[]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let result = super::probe(&reqwest::Client::new(), port).await.unwrap();
+        assert_eq!(result.port, 58000);
+        assert_eq!(result.status, crate::model::MowerStatus::Sleeping);
+        assert!(!result.requires_token);
+    }
+
+    #[tokio::test]
+    async fn discovers_token_protected_alpha_through_public_index() {
+        let port = protected_server("<html><head><title>arknights-mower</title></head></html>");
+        let result = super::probe(&reqwest::Client::new(), port).await;
+        assert_eq!(result.as_ref().map(|instance| instance.port), Some(port));
+    }
+
+    #[tokio::test]
+    async fn ignores_unrelated_forbidden_http_service() {
+        let port = protected_server("<html><title>Another service</title></html>");
+        assert!(super::probe(&reqwest::Client::new(), port).await.is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn enumerates_listening_ports() {
