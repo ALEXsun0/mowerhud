@@ -314,6 +314,31 @@ fn legacy_shifts_and_explicit_full_mood_names_are_preserved() {
     assert_eq!(task_summary(&task), "回满上班");
 }
 
+#[test]
+fn special_display_names_override_detailed_titles_in_both_task_slots() {
+    for (kind, stage, title) in [
+        ("用尽下班", "轮休协调", "但书下班"),
+        ("纠错", "替班交接", "能天使上班；空弦下班"),
+        ("跑单", "恢复原班", "但书上班"),
+    ] {
+        let mut value = alpha_task(Local::now(), "", kind, 2);
+        value["display_name"] = json!(stage);
+        value["presentation"]["title"] = json!(title);
+        let task: Task = serde_json::from_value(value).unwrap();
+        let info = task_info_from_tasks(vec![task.clone(), task])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            [
+                info.current_name.as_str(),
+                info.next_task.as_ref().unwrap().name.as_str()
+            ],
+            [stage, stage],
+            "{kind}: {title}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn both_existing_transports_summarize_current_and_next_tasks() {
     for local in [false, true] {

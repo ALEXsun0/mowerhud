@@ -350,8 +350,13 @@ fn task_label(task: &Task) -> String {
 /// 先保留特殊阶段，再将普通上下班合并为 HUD 短名称。
 fn task_summary(task: &Task) -> String {
     let title = task_label(task);
-    if matches!(title.as_str(), "恢复原班" | "替班交接" | "轮休协调") {
-        return title;
+    for label in [
+        task.display_name.as_deref().unwrap_or_default(),
+        title.as_str(),
+    ] {
+        if matches!(label, "恢复原班" | "替班交接" | "轮休协调") {
+            return label.to_string();
+        }
     }
     if task.task_type.display_value == "用尽下班" {
         return "用尽下班".into();
